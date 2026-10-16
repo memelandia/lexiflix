@@ -1,102 +1,29 @@
-exports.handler = async (event, context) => {
-    // Configurar CORS
-    const headers = {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'POST, OPTIONS',
-        'Content-Type': 'application/json'
-    };
+// Login del admin. Valida contra el hash guardado en PostgreSQL (pgcrypto/bcrypt) y devuelve un token
+// firmado que el admin manda en cada operación. Mismas reglas que antes: usuario sin distinguir
+// mayúsculas, ambos recortados de espacios de copiar/pegar; la contraseña sigue siendo exacta.
+const { sql, json, ruletaId, leerBody, crearToken, evento, handler } = require('./utils/db');
 
-    // Manejar preflight OPTIONS request
-    if (event.httpMethod === 'OPTIONS') {
-        return {
-            statusCode: 200,
-            headers,
-            body: ''
-        };
-    }
+exports.handler = handler(['POST'], async (event) => {
+  const rid = await ruletaId();
+  const body = leerBody(event);
+  const username = String((body && body.username) || '').trim();
+  const ua = String((event.headers && (event.headers['user-agent'] || event.headers['User-Agent'])) || '').slice(0, 200);
+  const password = String((body && body.password) || '').trim();
+  if (!username || !password) return json(400, { success: false, message: 'Username y password son requeridos.' });
 
-    // Solo aceptar métodos POST
-    if (event.httpMethod !== 'POST') {
-        return {
-            statusCode: 405,
-            headers,
-            body: JSON.stringify({
-                success: false,
-                message: 'Método no permitido. Use POST.'
-            })
-        };
-    }
+  const [{ n }] = await sql`
+    SELECT count(*)::int AS n FROM ruletas.evento
+    WHERE ruleta_id = ${rid} AND tipo = 'login_fallido' AND creado_at > NOW() - interval '15 minutes'`;
+  if (n >= 15) return json(429, { success: false, message: 'Demasiados intentos. Esperá unos minutos.' });
 
-    try {
-        // Parsear el body de la petición
-        const { username, password } = JSON.parse(event.body);
-
-        // Validar que se enviaron ambos campos
-        if (!username || !password) {
-            return {
-                statusCode: 400,
-                headers,
-                body: JSON.stringify({
-                    success: false,
-                    message: 'Username y password son requeridos.'
-                })
-            };
-        }
-
-        // Obtener credenciales desde variables de entorno
-        const validUsername = process.env.ADMIN_USER;
-        const validPassword = process.env.ADMIN_PASS;
-
-        // Verificar que las variables de entorno estén configuradas
-        if (!validUsername || !validPassword) {
-            console.error('Variables de entorno ADMIN_USER o ADMIN_PASS no configuradas');
-            return {
-                statusCode: 500,
-                headers,
-                body: JSON.stringify({
-                    success: false,
-                    message: 'Error de configuración del servidor.'
-                })
-            };
-        }
-
-        // Comparación segura de credenciales (case-sensitive)
-        const isValidUsername = username === validUsername;
-        const isValidPassword = password === validPassword;
-
-        if (isValidUsername && isValidPassword) {
-            // Login exitoso
-            return {
-                statusCode: 200,
-                headers,
-                body: JSON.stringify({
-                    success: true,
-                    message: 'Login exitoso',
-                    user: username
-                })
-            };
-        } else {
-            // Credenciales incorrectas
-            return {
-                statusCode: 401,
-                headers,
-                body: JSON.stringify({
-                    success: false,
-                    message: 'Credenciales incorrectas'
-                })
-            };
-        }
-
-    } catch (error) {
-        console.error('Error en función login:', error);
-        return {
-            statusCode: 500,
-            headers,
-            body: JSON.stringify({
-                success: false,
-                message: 'Error interno del servidor'
-            })
-        };
-    }
-};
+  const [r] = await sql`
+    SELECT slug, sesion_version,
+           (lower(btrim(admin_user)) = lower(${username}) AND crypt(${password}, admin_pass_hash) = admin_pass_hash) AS ok
+    FROM ruletas.ruleta WHERE id = ${rid}`;
+  if (!r || !r.ok) {
+    await evento(rid, 'login_fallido', { usuario: username.slice(0, 60), ua });
+    return json(401, { success: false, message: 'Credenciales incorrectas' });
+  }
+  await evento(rid, 'login_ok', { usuario: username.slice(0, 60), ua });
+  return json(200, { success: true, message: 'Login exitoso', user: username, token: await crearToken(r.slug, r.sesion_version) });
+});
